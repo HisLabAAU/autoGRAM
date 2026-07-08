@@ -10,3 +10,5 @@ The graphing pipelin consists of steps.
 4. Graph.
 
 Each step is a separate file.
+
+Howeer. We also include a different version (FULL_STACK.qmd) which performs the part-of-speech-tagging using an LLM. This is a good place to start.
