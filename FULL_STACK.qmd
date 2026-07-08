@@ -1,0 +1,772 @@
+---
+title: EXPLAINER
+jupyter: python3
+---
+
+
+This is a fully automated graphing based on LLM. The accompanying R-script (TO_GRAPH.R) renders the output into a graph. Make the necessary adjustments in the first cell and run all. Note that the second cell samples a text. If you want to process all texts, skip this cell, and point the pd.read_csv in the second cell directly towards DATASET. 
+
+
+```{python}
+API_KEY = "YOUR_KEY_GOES_HERE"
+LLM_OF_CHOICE = "mistral/mistral-large-2512"
+DATASET = "Run_ads_standardised.csv" # NEEDS THE FOLLOWING VARIABLES: 'id', 'column'
+```
+
+Sampling texts:
+
+```{python}
+import pandas as pd
+import random
+
+df = pd.read_csv(DATASET)
+
+groups = df['id'].unique()
+
+sampled_groups = random.sample(list(groups), 1)
+
+df_sample = df[df['id'].isin(sampled_groups)]
+
+df_sample.to_csv("sampled_texts.csv", index=False)
+```
+
+Finding verbs using LLM
+
+```{python}
+import dspy
+import pandas as pd
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+dspy.configure(lm=lm)
+
+df = pd.read_csv('sampled_texts.csv')
+
+class ExtractActionData(dspy.Signature):
+    """Tag verbs in text.
+    Role: You are an expert linguist specializing in eighteenth-century text.
+    Task: You are given a historical text. You need to wrap all verbs in guillemets («verb»). Make no other changes and make no comments.
+    """
+
+    text: str | None = dspy.InputField(desc="A historical source.")
+    Tagged_text: str | None = dspy.OutputField(desc="The text with verbs wrapped in guillemets.")
+
+classify = dspy.Predict(ExtractActionData)
+
+results = []
+for idx, row in df.iterrows():
+    try:
+        response = classify(text=row.get('text'))
+        results.append({
+            'Tagged_text': response.Tagged_text,
+        })
+        print(f"Processed {idx + 1}/{len(df)}")
+    except Exception as e:
+        print(f"Error on row {idx}: {e}")
+        results.append({
+            'Tagged_text': None,
+        })
+
+
+results_df = pd.DataFrame(results)
+df = pd.concat([df, results_df], axis=1)
+
+df.to_csv('Sampled_texts_tagged.csv', index=False)
+
+# lm.inspect_history(n=1) # THIS ENABLES YOU TO CHECK WHAT THE PROMPT LOOKS LIKE.
+```
+
+Making it one-row-per-verb:
+
+```{python}
+import pandas as pd
+import re
+
+# 1. Load the dataframe first from the specified CSV file
+df = pd.read_csv("Sampled_texts_tagged.csv")
+
+def split_by_guillemet_instances(dataframe, input_column, output_column):
+    rows = []
+    
+    for _, row in dataframe.iterrows():
+        original_text = str(row[input_column])
+        
+        parts = re.split(r'[«»]', original_text)
+        
+        num_verbs = len(parts) // 2
+        
+        for i in range(num_verbs):
+            new_parts = []
+            target_verb = ""
+            
+            for index, part in enumerate(parts):
+                if index % 2 == 1:
+                    verb_index = index // 2
+                    if verb_index == i:
+                        new_parts.append(f"«{part}»")
+                        target_verb = part
+                    else:
+                        new_parts.append(part)
+                else:
+                    new_parts.append(part)
+            
+            new_text = "".join(new_parts)
+            
+            new_row = row.copy()
+            new_row[output_column] = new_text
+            new_row['target_verb'] = target_verb 
+            
+            rows.append(new_row)
+            
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+# 2. Run the function
+result_df = split_by_guillemet_instances(df, input_column='Tagged_text', output_column='One_tag_text')
+
+result_df.to_csv("sampled_texts_verbs.csv", index=False)
+```
+
+Extracting subjevt-verb-object triples + extras
+
+```{python}
+import dspy
+import pandas as pd
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+dspy.configure(lm=lm)
+
+df = pd.read_csv('sampled_texts_verbs.csv')
+
+class ExtractActionData(dspy.Signature):
+    """Extract semantic action triples from nineteenth-century runaway advertisement.
+
+    Role: You are an expert computational linguist specializing in 19th-century text and
+    semantic role labeling.
+
+    You are given a runaway advertisement with ONE specific verb occurrence marked inline using »double angle
+    quotes«, e.g. »run«. This marked verb — and ONLY this specific occurrence — is the action
+    you must analyze, even if the same verb (or a NER-tokenized/merged form of it) appears elsewhere
+    unmarked in the text. Ignore all other occurrences of the same or similar verbs.
+
+    CRITICAL — subject identification: Do NOT default to the advertisement's protagonist as Subject unless they are
+    genuinely the one performing THIS marked action. Determine the subject strictly from the local
+    clause around the marker."""
+
+    One_tag_text: str | None = dspy.InputField(desc="A text with one verb instance marked in guillemets.")
+    Subject: str | None = dspy.OutputField(desc="The semantic subject of the marked verb — the specific entity performing THIS action.")
+    Title: str | None = dspy.OutputField(desc="The occupational title, judicial status or other emic label of the semantic subject of the marked verb.")
+    Verb: str | None = dspy.OutputField(desc="The full, reconstructed form of the marked verb.")
+    Object: str | None = dspy.OutputField(desc="The full semantic object of the marked verb specifically. If none output null.")
+    Infinitive: str | None = dspy.OutputField(desc="The infinitive form of the marked verb and ONLY the marked verb.")
+    Snippet: str | None = dspy.OutputField(desc="The full sentence containing the marked verb occurrence (without the » « markers in your output). Make no corrections to the original wording.")
+
+classify = dspy.Predict(ExtractActionData)
+
+results = []
+for idx, row in df.iterrows():
+    try:
+
+        response = classify(One_tag_text=row.get('One_tag_text'))
+        results.append({
+            'Subject': response.Subject,
+            'Title': response.Title,
+            'Verb': response.Verb,
+            'Object': response.Object,
+            'Infinitive': response.Infinitive,
+            'Snippet': response.Snippet
+        })
+        print(f"Processed {idx + 1}/{len(df)}")
+    except Exception as e:
+        print(f"Error on row {idx}: {e}")
+        results.append({
+            'Subject': None,
+            'Title': None,
+            'Verb': None,
+            'Object': None,
+            'Infinitive': None,
+            'Snippet': None
+        })
+
+results_df = pd.DataFrame(results)
+df = pd.concat([df, results_df], axis=1)
+
+df.to_csv('Sampled_verbs_subjects_objects.csv', index=False)
+```
+
+Extracting location
+
+```{python}
+import dspy
+import pandas as pd
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+
+dspy.configure(lm=lm)
+
+df = pd.read_csv('Sampled_verbs_subjects_objects.csv') 
+
+class ExtractActionData(dspy.Signature):
+    """Extract the location of an action described in a runaway advertisement c. 1800.
+    'Location' includes both proper place names (e.g. city, street, or building names)
+    and vague or relational spatial references (e.g. "at her mother's", "in the field",
+    "nearby", "at home"). Extract the location as it is actually expressed in the
+    snippet — do not invent a specific place name if the source only gives a vague
+    or relational description.
+    Use the snippet itself as the primary evidence, but use the subject, title,
+    verb, and surrounding text as supporting context to resolve ambiguous or
+    implicit location references (e.g. pronouns, deictic phrases, or locations
+    only named earlier in the source text)."""
+
+    text: str | None = dspy.InputField(desc="The full source text the snippet was drawn from, for context. The target verb is wrapped in guillemets.")
+    Subject: str | None = dspy.InputField(desc="The subject performing the action")
+    Title: str | None = dspy.InputField(desc="The title or heading associated with this entry")
+    Verb: str | None = dspy.InputField(desc="The verb describing the action")
+    Snippet: str | None = dspy.InputField(desc="The text snippet describing the action")
+    Location: str | None = dspy.OutputField(desc="The location of the action as expressed in the snippet. This may be a proper name (city, street, building) or a vague/relational description (e.g. 'in the field', 'at her mother's', 'outside'). Resolve pronouns or deictic references using context, but preserve the original level of specificity — do not upgrade a vague mention into a named place unless the text itself supports that identification.")
+
+classify = dspy.ChainOfThought(ExtractActionData)
+
+results = []
+for idx, row in df.iterrows():
+    try:
+        response = classify(
+            text=row.get('One_tag_text'),
+            Subject=row.get('Subject'),
+            Title=row.get('Title'),
+            Verb=row.get('Verb'),
+            Snippet=row['Snippet'],
+        )
+        results.append({
+            'Location': response.Location,
+        })
+        print(f"Processed {idx + 1}/{len(df)}")
+    except Exception as e:
+        print(f"Error on row {idx}: {e}")
+        results.append({
+            'Location': None,
+        })
+
+results_df = pd.DataFrame(results)
+df = pd.concat([df, results_df], axis=1)
+df.to_csv('Sampled_verbs_location.csv', index=False)
+
+lm.inspect_history(n=1)
+```
+
+Instruments:
+
+```{python}
+import dspy
+import pandas as pd
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+dspy.configure(lm=lm)
+
+df = pd.read_csv('Sampled_verbs_location.csv')
+
+class ExtractInstrumentData(dspy.Signature):
+    """Extract the instrument(s) used to carry out an action described in a 19th-century text snippet.
+
+    An instrument is any object, tool, or document that supports or enables the
+    action — for example tools for a work task, papers for an identity inspection,
+    coins for a purchase, a weapon for an assault, or a letter for a communication.
+    Use the snippet as the primary evidence, but use the subject, title, verb, and
+    surrounding text as supporting context to resolve ambiguous or implicit
+    references. If multiple distinct instruments are mentioned, list them all,
+    separated by commas. If no instrument is mentioned, return None."""
+
+    text: str | None = dspy.InputField(desc="The full source text the snippet was drawn from, for context. The target verb is wrapped in guillemets.")
+    Subject: str | None = dspy.InputField(desc="The subject performing the action")
+    Title: str | None = dspy.InputField(desc="The title or heading associated with this entry")
+    Verb: str | None = dspy.InputField(desc="The verb describing the action")
+    action_info: str | None = dspy.InputField(desc="The text snippet describing the action")
+    Instrument: str | None = dspy.OutputField(desc="The instrument(s) used in the action, as a single string, comma-separated if more than one is mentioned, or None if no instrument is mentioned. Instruments have to be mentioned explicitly.")
+
+classify = dspy.ChainOfThought(ExtractInstrumentData)
+
+results = []
+for idx, row in df.iterrows():
+    try:
+        response = classify(
+            text=row.get('text'),
+            Subject=row.get('Subject'),
+            Title=row.get('Title'),
+            Verb=row.get('Verb'),
+            action_info=row['Snippet'],
+        )
+        results.append({
+            'Instrument': response.Instrument,
+        })
+        print(f"Processed {idx + 1}/{len(df)}")
+    except Exception as e:
+        print(f"Error on row {idx}: {e}")
+        results.append({
+            'Instrument': None,
+        })
+
+results_df = pd.DataFrame(results)
+df = pd.concat([df, results_df], axis=1)
+df.to_csv('Sampled_verbs_instruments.csv', index=False)
+```
+
+Subject-disambiguation:
+
+```{python}
+import dspy
+import pandas as pd
+import json
+from pydantic import BaseModel
+from typing import List
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+dspy.configure(lm=lm)
+
+df = pd.read_csv('Sampled_verbs_instruments.csv')
+
+class EntityCluster(BaseModel):
+    entity_id: int
+    canonical_subject: str
+    mention_indices: List[int]
+
+class DisambiguateEntities(dspy.Signature):
+    """Cluster subject mentions extracted from the same 19th-century text that refer to the same entity. Entities include people, but also objects and immaterial actors. Use Subject, Title, Verb, and Snippet (plus the source text for context) to decide whether two mentions denote the same entity, even if named slightly differently (titles, spelling, partial names). Every mention index must appear in exactly one cluster; singletons are fine."""
+    text: str = dspy.InputField(desc="The full source text shared by all mentions in this group")
+    mentions: str = dspy.InputField(desc="JSON array of mentions: [{index, Subject, Title, Verb, Snippet}, ...]")
+    clusters: List[EntityCluster] = dspy.OutputField(desc="Clusters of mention indices referring to the same entity, each with a unique entity_id and a canonical_subject label")
+
+disambiguate = dspy.ChainOfThought(DisambiguateEntities)
+
+all_groups = []
+
+for text_id, group in df.groupby('id'):
+    group = group.reset_index(drop=True)
+    mentions_payload = [
+        {
+            "index": i,
+            "Subject": row['Subject'],
+            "Title": row['Title'],
+            "Verb": row['Verb'],
+            "Snippet": row['Snippet'],
+        }
+        for i, row in group.iterrows()
+    ]
+    text_value = group['text'].iloc[0]
+
+    index_to_entity, index_to_canon = {}, {}
+    try:
+        response = disambiguate(text=text_value, mentions=json.dumps(mentions_payload, ensure_ascii=False))
+        for cluster in response.clusters:
+            for idx in cluster.mention_indices:
+                index_to_entity[idx] = cluster.entity_id
+                index_to_canon[idx] = cluster.canonical_subject
+    except Exception as e:
+        print(f"Error on id {text_id}: {e}")
+
+    # fallback: give any unassigned row its own singleton cluster
+    next_id = (max(index_to_entity.values(), default=-1) + 1)
+    for idx in group.index:
+        if idx not in index_to_entity:
+            index_to_entity[idx] = next_id
+            index_to_canon[idx] = group.loc[idx, 'Subject']
+            next_id += 1
+
+    group['local_entity_id'] = group.index.map(index_to_entity)
+    group['cluster_id'] = group['local_entity_id'].apply(lambda x: f"{text_id}-{x}")
+    group['canonical_subject'] = group.index.map(index_to_canon)
+    all_groups.append(group)
+
+    print(f"Processed id {text_id} ({len(group)} mentions)")
+
+result_df = pd.concat(all_groups, ignore_index=True)
+result_df.to_csv('disambiguated_entities.csv', index=False)
+```
+
+Object-disambiguation (against already identified subjects)
+
+```{python}
+import dspy
+import pandas as pd
+import json
+from pydantic import BaseModel
+from typing import List, Optional
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+dspy.configure(lm=lm)
+
+class ObjectMatch(BaseModel):
+    mention_index: int
+    matched_entity_id: Optional[int]
+
+class MatchObjectsToEntities(dspy.Signature):
+    """For each mention, check the Object field, using the full source text as context to resolve references (e.g. pronouns, "the same X", or other back-references). Determine whether the Object mentions/names one of the already-disambiguated entities listed below — i.e. contains a name, title, or clear designation matching an entity's canonical_subject. If the Object does not reference any already listed entity, set matched_entity_id to null."""
+    text: str = dspy.InputField(desc="The full source text shared by all mentions in this group, for context")
+    entities: str = dspy.InputField(desc="JSON array of disambiguated entities: [{entity_id, canonical_subject}, ...]")
+    mentions: str = dspy.InputField(desc="JSON array of mentions to check: [{index, Object}, ...]")
+    matches: List[ObjectMatch] = dspy.OutputField(desc="One match result per mention_index, matched_entity_id is the entity_id explicitly named in the Object, or null if none")
+
+class ObjectCluster(BaseModel):
+    canonical_object: str
+    mention_indices: List[int]
+
+class DisambiguateNewObjects(dspy.Signature):
+    """The Object mentions below did NOT match any already-known entity. Cluster these objects so that mentions referring to the same entity (such as a physical object, document, or idea) are grouped together, even if worded differently (e.g. "his papers" and "the papers" referring back to the same documents). Objects include things like tools, papers, coins, or any other item involved in the action. Objects can also be immaterial. Use the full source text for context. Every mention index must appear in exactly one cluster; singletons are fine. Give each cluster a canonical_object label describing what the object is."""
+    text: str = dspy.InputField(desc="The full source text shared by all mentions in this group")
+    mentions: str = dspy.InputField(desc="JSON array of unmatched object mentions: [{index, Object}, ...]")
+    clusters: List[ObjectCluster] = dspy.OutputField(desc="Clusters of mention indices referring to the same new object, each with a canonical_object label")
+
+match_objects = dspy.ChainOfThought(MatchObjectsToEntities)
+disambiguate_objects = dspy.ChainOfThought(DisambiguateNewObjects)
+
+df = pd.read_csv('disambiguated_entities.csv')
+
+all_groups = []
+for text_id, group in df.groupby('id'):
+    group = group.reset_index(drop=True)
+
+    text_value = group['text'].iloc[0]
+
+    entities_for_text = (
+        group[['local_entity_id', 'canonical_subject']]
+        .drop_duplicates()
+        .rename(columns={'local_entity_id': 'entity_id'})
+        .to_dict(orient='records')
+    )
+    object_payload = [
+        {"index": i, "Object": row.get('Object')}
+        for i, row in group.iterrows()
+    ]
+
+    index_to_object_entity = {}
+    index_to_object_canon = {}
+
+    try:
+        match_response = match_objects(
+            text=text_value,
+            entities=json.dumps(entities_for_text, ensure_ascii=False),
+            mentions=json.dumps(object_payload, ensure_ascii=False),
+        )
+        for m in match_response.matches:
+            index_to_object_entity[m.mention_index] = m.matched_entity_id
+    except Exception as e:
+        print(f"Error matching objects on id {text_id}: {e}")
+
+    canon_lookup = dict(zip(group['local_entity_id'], group['canonical_subject']))
+
+    unmatched_indices = [
+        i for i in group.index
+        if index_to_object_entity.get(i) is None
+    ]
+
+    if unmatched_indices:
+        unmatched_payload = [
+            {"index": i, "Object": group.loc[i, 'Object']}
+            for i in unmatched_indices
+        ]
+        next_id = int(group['local_entity_id'].max()) + 1
+
+        try:
+            cluster_response = disambiguate_objects(
+                text=text_value,
+                mentions=json.dumps(unmatched_payload, ensure_ascii=False),
+            )
+            for cluster in cluster_response.clusters:
+                new_id = next_id
+                next_id += 1
+                for idx in cluster.mention_indices:
+                    index_to_object_entity[idx] = new_id
+                    index_to_object_canon[idx] = cluster.canonical_object
+        except Exception as e:
+            print(f"Error disambiguating new objects on id {text_id}: {e}")
+            # fallback: each unmatched mention becomes its own singleton new object
+            for idx in unmatched_indices:
+                index_to_object_entity[idx] = next_id
+                index_to_object_canon[idx] = group.loc[idx, 'Object']
+                next_id += 1
+
+    group['object_entity_id'] = group.index.map(lambda i: index_to_object_entity.get(i))
+    group['object_cluster_id'] = group['object_entity_id'].apply(lambda x: f"{text_id}-{x}" if pd.notna(x) else None)
+    group['object_canonical'] = group.index.map(
+        lambda i: canon_lookup.get(index_to_object_entity.get(i))
+        if index_to_object_entity.get(i) in canon_lookup
+        else index_to_object_canon.get(i)
+    )
+
+    all_groups.append(group)
+    print(f"Processed id {text_id} ({len(group)} mentions)")
+
+result_df = pd.concat(all_groups, ignore_index=True)
+result_df.to_csv('disambiguated_entities_with_objects.csv', index=False)
+```
+
+Role-labelling of subjects and objects:
+
+```{python}
+import dspy
+import pandas as pd
+import json
+from pydantic import BaseModel
+from typing import Optional
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+dspy.configure(lm=lm)
+
+GRAM_ROLES = [
+    "HAS_ADDRESSEE", "HAS_AGENT", "HAS_BENEFACTIVE", "HAS_COMITATIVE",
+    "HAS_EFFECTOR", "HAS_EXPERIENCER", "HAS_INSTRUMENT", "HAS_MEDIATOR",
+    "HAS_MEDIUM", "HAS_PATIENT", "HAS_RECIPIENT", "HAS_RESULT",
+    "HAS_TARGET", "HAS_THEME",
+]
+
+class RoleLabels(BaseModel):
+    subject_role: Optional[str]  # one of GRAM_ROLES, or null if subject is absent/inapplicable
+    object_role: Optional[str]   # one of GRAM_ROLES, or null if object is absent/inapplicable
+
+class LabelSemanticRoles(dspy.Signature):
+    """Label the semantic role of the canonical subject and canonical object in the action described by the verb, using the GRAM framework role inventory below. Choose exactly one role per entity (subject and object) from this closed list, based on how that actor participates in the action denoted by the verb in the snippet. If an actor is absent, unclear, or the role inventory does not apply, set its role to null.
+
+    HAS_ADDRESSEE: the entity receives a message through the action and is thereby its audience
+    HAS_AGENT: the entity is the agent performing the action itself
+    HAS_PATIENT: the entity is the patient of the action (often the semantic object)
+    HAS_BENEFACTIVE: the entity derives a benefit from the action but is not its agent
+    HAS_COMITATIVE: the entity is performing the action together with others, becoming co-agents of the action
+    HAS_EFFECTOR: the entity triggers or causes the action but is not the agent (e.g. the person who orders the action, or an environmental event that causes the action)
+    HAS_EXPERIENCER: the entity observes, perceives, or senses the action, but is neither its agent or its addressee (e.g. a feeling)
+    HAS_INSTRUMENT: the entity is a tool used in the action
+    HAS_MEDIATOR: the entity serves actively as an intermediary between the agent and the patient
+    HAS_MEDIUM: the entity is the material means through which mediation is realized (e.g. a contract, an amount of money, a transportation)  
+    HAS_RECIPIENT: the entity receives something tangible through the action (as possessor)
+    HAS_RESULT: the entity comes into existence through the action
+    HAS_TARGET: the entity is the yet unrealized target or ambition of action
+    HAS_THEME: the entity is the topic of verbal action (e.g. of a discussion or a narrative)
+    """
+    verb: str = dspy.InputField(desc="The full verb describing the action")
+    snippet: str = dspy.InputField(desc="The text snippet describing the action, for context")
+    canonical_subject: Optional[str] = dspy.InputField(desc="The canonical (disambiguated) subject actor, or null if absent")
+    canonical_object: Optional[str] = dspy.InputField(desc="The canonical (disambiguated) object actor, or null if absent")
+    roles: RoleLabels = dspy.OutputField(desc="The GRAM role of the subject and of the object")
+
+label_roles = dspy.ChainOfThought(LabelSemanticRoles)
+
+df = pd.read_csv('disambiguated_entities_with_objects.csv')  # needs: Verb, Snippet, canonical_subject, object_canonical
+
+subject_roles, object_roles = [], []
+
+for idx, row in df.iterrows():
+    try:
+        response = label_roles(
+            verb=row['Verb'],
+            snippet=row['Snippet'],
+            canonical_subject=row.get('canonical_subject') if pd.notna(row.get('canonical_subject')) else None,
+            canonical_object=row.get('object_canonical') if pd.notna(row.get('object_canonical')) else None,
+        )
+        role = response.roles
+        subject_roles.append(role.subject_role)
+        object_roles.append(role.object_role)
+        print(f"Processed {idx + 1}/{len(df)}")
+    except Exception as e:
+        print(f"Error on row {idx}: {e}")
+        subject_roles.append(None)
+        object_roles.append(None)
+
+df['subject_gram_role'] = subject_roles
+df['object_gram_role'] = object_roles
+df.to_csv('disambiguated_entities_with_roles.csv', index=False)
+```
+
+Role-labelling of places
+
+```{python}
+import dspy
+import pandas as pd
+import json
+from pydantic import BaseModel
+from typing import Optional
+
+lm = dspy.LM(LLM_OF_CHOICE, api_key=API_KEY, num_retries=5)
+dspy.configure(lm=lm)
+
+GRAM_ROLES = [
+    "TAKES_PLACE", "HAS_DESTINATION", "HAS_ORIGIN", "IS_SUBJECT_OF",
+]
+
+class RoleLabels(BaseModel):
+    location_role: Optional[str]  # one of GRAM_ROLES, or null if subject is absent/inapplicable
+
+class LabelSemanticRoles(dspy.Signature):
+    """Label the role of the place mentioned as part of a snippet of text describing an action, using the role inventory below. Choose exactly one role per location from this closed list, based on what role the place has in the action denoted by the verb in the snippet. If a location is absent, unclear, or the role inventory does not apply, set its role to null.
+
+    TAKES_PLACE: the location is where the action itself takes place
+    HAS_DESTINATION: the location is mentioned as the destination of an action, typically involving mobility
+    HAS_ORIGIN: the location is the spatial starting-point of an action that has a destination (that might or might not be mentioned)
+    IS_SUBJECT_OF: the location is mentioned as the location of a past, future or hypothetical action
+    """
+    verb: str = dspy.InputField(desc="The full verb describing the action")
+    snippet: str = dspy.InputField(desc="The text snippet describing the action, for context")
+    canonical_subject: Optional[str] = dspy.InputField(desc="The canonical (disambiguated) subject actor, or null if absent")
+    canonical_object: Optional[str] = dspy.InputField(desc="The canonical (disambiguated) object actor, or null if absent")
+    roles: RoleLabels = dspy.OutputField(desc="The GRAM role of the location")
+
+label_roles = dspy.ChainOfThought(LabelSemanticRoles)
+
+df = pd.read_csv('disambiguated_entities_with_roles.csv')  # needs: Verb, Snippet, canonical_subject, object_canonical
+
+location_roles = []
+
+for idx, row in df.iterrows():
+    try:
+        response = label_roles(
+            verb=row['Verb'],
+            snippet=row['Snippet'],
+            canonical_subject=row.get('canonical_subject') if pd.notna(row.get('canonical_subject')) else None,
+            canonical_object=row.get('object_canonical') if pd.notna(row.get('object_canonical')) else None,
+        )
+        role = response.roles
+        location_roles.append(role.location_role)
+        print(f"Processed {idx + 1}/{len(df)}")
+    except Exception as e:
+        print(f"Error on row {idx}: {e}")
+        location_roles.append(None)
+
+df['location_gram_role'] = location_roles
+
+df.to_csv('disambiguated_entities_with_roles_location.csv', index=False)
+```
+
+Making it a graph and representing it visually:
+
+```{r}
+library(tidyverse)
+library(tidygraph)
+library(ggraph)
+
+df <- read.csv("disambiguated_entities_with_roles_location.csv") %>% 
+  mutate(object_cluster_id = str_remove(object_cluster_id, "\\.\\d$"),
+         Location = str_remove(Location, " \\#.+$"),
+         Location = str_remove(Location, "\\*.+$"),
+         Location = str_remove_all(Location, '"'),
+         Location = trimws(Location),
+        Action_id = 1, Action_id = cumsum(Action_id)) %>% 
+  filter(Infinitive != lag(Infinitive, default = "PLACEHOLDER"))
+
+groups <- unique(df$id)
+sampled_groups <- sample(groups, 1)
+df <- df %>% filter(id %in% sampled_groups)
+
+instruments <- df %>% filter(str_count(Instrument) > 1) %>% 
+  mutate(Instrument = str_remove(Instrument, " \\#.+$"),
+         type = "object",
+         Actor_id = paste(as.character(id), Instrument, sep = "_"),
+         Label = Instrument) %>% 
+  select(Actor_id, Label, type) %>% 
+  group_by(Actor_id) %>% 
+  slice(1) %>% 
+  ungroup()
+
+INSTRUMENT_RELATION <- df %>% filter(str_count(Instrument) > 1) %>% 
+  mutate(relation_type = "HAS_INSTRUMENT",
+         Actor_id = paste(as.character(id), Instrument, sep = "_"),
+         Label = Instrument) %>% 
+  select(Action_id, Actor_id, relation_type)
+
+actors_1 <- df %>% 
+  group_by(cluster_id) %>% 
+  mutate(
+    Title = case_when(Title == Subject ~ "", .default = Title),
+    emic_labels = paste(Title, sep = "; ")) %>% 
+  slice(1) %>% 
+  select(cluster_id, canonical_subject, emic_labels) %>% 
+  rename(Label = canonical_subject,
+         Actor_id = cluster_id)
+
+actors_2 <- df %>% 
+  group_by(object_cluster_id) %>%
+  slice(1) %>% 
+  select(object_cluster_id, object_canonical) %>% 
+  rename(Label = object_canonical)
+
+actors_2 <- actors_2 %>% 
+  anti_join(actors_1, join_by(object_cluster_id == Actor_id)) %>% 
+  filter(str_count(object_cluster_id) > 1) %>% 
+  rename(Actor_id = object_cluster_id)
+
+actors <- actors_1 %>% 
+  rbind(actors_2) %>%
+  mutate(type = "actor")
+
+places <- df %>% 
+  select(Location, id) %>% 
+  mutate(Actor_id = paste(id, "place", Location, sep = "_"),
+         type = "place") %>% 
+  rename(Label = Location) %>% select(-id) %>%
+  group_by(Actor_id) %>%
+  slice(1)
+
+actions <- df %>% 
+  select(Action_id, id, date, Infinitive, Snippet) %>% 
+  mutate(type = "action", Action_id = as.character(Action_id)) %>% 
+  rename(Label = Infinitive,
+         Actor_id = Action_id,
+         Text_id = id)
+
+action_sequences <- df %>% 
+  group_by(id) %>% 
+  mutate(next_action_id = lead(Action_id),
+         relation_type = "NEXT") %>% 
+  ungroup() %>% 
+  select(Action_id, next_action_id, relation_type) %>% 
+  na.omit() %>% 
+  rename(From = Action_id,
+         To = next_action_id)
+
+nodes <- actors %>% 
+  rbind(instruments, places, actions) %>% 
+  filter(str_count(Label) > 1)
+
+TAKES_PLACE <- df %>% 
+  filter(str_count(Location) > 1) %>%
+  mutate(relation_type = location_gram_role,
+         Actor_id = paste(id, "place", Location, sep = "_")) %>%
+  select(Action_id, Actor_id, relation_type)
+
+SUBJECT_RELATION <- df %>% 
+  filter(str_count(cluster_id) > 1) %>%
+  rename(relation_type = subject_gram_role) %>%
+  select(Action_id, cluster_id, relation_type) %>% 
+  rename(Actor_id = cluster_id)
+
+OBJECT_RELATION <- df %>%
+  filter(str_count(object_cluster_id) > 1) %>% 
+  rename(relation_type = object_gram_role) %>% 
+  select(Action_id, object_cluster_id, relation_type) %>% 
+  rename(Actor_id = object_cluster_id)
+
+TO_ACTION <- SUBJECT_RELATION %>% 
+  rbind(INSTRUMENT_RELATION, OBJECT_RELATION, TAKES_PLACE) %>% 
+  filter(str_count(relation_type) > 1) %>% 
+  rename(From = Action_id, To = Actor_id) %>% 
+  rbind(action_sequences) %>% 
+  filter(!duplicated(paste(From, To, relation_type)))
+
+Graph <- as_tbl_graph(TO_ACTION) %>%
+  activate(nodes) %>% 
+  left_join(nodes, join_by(name == Actor_id))  %>% 
+  mutate(Hybrid_label = case_when(str_count(emic_labels) > 1 ~ paste(Label, emic_labels, sep = "\n"), .default = Label),
+         Hybrid_label = str_remove(Hybrid_label, "^to ")) %>% 
+  activate(edges) %>% 
+  mutate(weight = case_when(relation_type == "NEXT" ~ 4, .default = 0.2))
+
+ggraph(Graph, layout = "fr") +
+  geom_node_point(aes(colour = type), size = 3) +
+  geom_node_text(aes(label = Hybrid_label),
+                 size = 5, repel = TRUE) +
+  geom_edge_link(aes(label = relation_type),
+                 angle_calc = "along",
+                 label_dodge = unit(1, "mm"),
+                 alpha = 0.1, label_size = 4, label_alpha = 0.3) +
+  theme_void() +
+  theme(legend.position = c(0.95, 0.95),
+        legend.justification = c(1, 1))
+
+df$text[1]
+```
+
+
